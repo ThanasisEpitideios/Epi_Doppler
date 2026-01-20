@@ -3,6 +3,19 @@
 ## Overview
 **Epi_Doppler v1** is a JSFX spatial movement tool for REAPER that simulates Doppler and distance behavior using a moving source around a listener. Motion can be **Linear** or **Custom Path**, and the sound is shaped by distance‑based delay, attenuation, panning, optional air absorption, stereo width, and output gain.
 
+## Installation
+### Windows
+1. In REAPER, go to Options → Show REAPER resource path in explorer/finder.
+2. Open the **Effects** folder.
+3. Copy `custom_path_doppler.jsfx` (or your JSFX file name) into **Effects**.
+4. In REAPER, open the FX browser and click **Re-scan** (or restart REAPER).
+
+### macOS
+1. In REAPER, go to Options → Show REAPER resource path in explorer/finder.
+2. Open the **Effects** folder.
+3. Copy `custom_path_doppler.jsfx` (or your JSFX file name) into **Effects**.
+4. In REAPER, open the FX browser and click **Re-scan** (or restart REAPER).
+
 ## Signal Flow (Conceptual)
 1. **Position** (Linear or Custom Path) → source $(x,y)$
 2. **Distance** $d = \sqrt{x^2 + y^2}$
