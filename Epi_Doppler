@@ -1,0 +1,424 @@
+desc:Epi_Doppler v1
+slider1:30<5, 1000, 0.1>Speed (km/h)
+slider2:0<0,1,1{Linear Loop,Custom Path}>Movement Mode
+slider3:1<0,1,1{Off,On}>Loop Enable
+slider4:0<0,1,1{Left to Right,Right to Left}>Linear Direction
+slider5:0<0,1,1{Wrap,PingPong}>Linear Loop Style
+slider6:0<0,1,1{-,Restart}>Restart
+slider7:5<0.5, 50, 0.1>Listener Distance Y (m)
+slider8:100<10, 1000, 1>Canvas Width (m) 
+slider9:0<0,500,1>Latency Compensation (ms)
+slider10:0<0,1,1{Off,On}>Air Lowpass
+slider11:100<0,100,1>Stereo Width (%)
+slider12:0<-12,12,0.1>Output Gain (dB)
+slider13:0<0,1,1{-,Clear Path}>Clear Path
+
+@init
+// --- MEMORY MAP ---
+buf_len = srate * 4; buf_l = 0; buf_r = 500000;
+cp_x = 1000000; cp_y = 1100000; // Control Points
+bk_x = 2000000; bk_y = 2100000; bk_d = 2200000; // Baked Path
+
+write_pos = 0;
+cur_dist = 0;
+bk_idx = 0;
+speed_sound = 340;
+is_updating = 0;
+drag_idx = -1; 
+
+lin_sign = 1;
+last_direction = -1;
+lpL = 0;
+lpR = 0;
+last_air_on = -1;
+lin_freeze = 0;
+path_freeze = 0;
+last_mode = -1;
+
+// --- RESTORE DATA ---
+gmem[0] == 12345 ? (
+    cp_cnt = gmem[1];
+    i = 0;
+    while (i < cp_cnt) (
+        cp_x[i] = gmem[1000 + i];
+        cp_y[i] = gmem[2000 + i];
+        i += 1;
+    );
+    force_bake = 1;
+) : (
+    cp_cnt = 0; bk_cnt = 0; total_len = 0;
+);
+
+@slider
+speed_ms = slider1 / 3.6;
+mode = slider2;
+loop_enable = slider3;
+direction = slider4;
+lin_style = slider5;
+def_dist_y = slider7;
+width = slider8;
+fixed_lat = (slider9 * 0.001) * srate;
+half_w = width / 2;
+stereo_w = slider11 / 100;
+gain = 10^(slider12/20);
+
+direction != last_direction ? (
+    lin_sign = direction == 0 ? 1 : -1;
+    lin_freeze = 0;
+    last_direction = direction;
+);
+
+mode != last_mode ? (
+    lin_freeze = 0;
+    path_freeze = 0;
+    last_mode = mode;
+);
+
+loop_enable ? (
+    lin_freeze = 0;
+    path_freeze = 0;
+);
+
+slider13 == 1 ? (
+    cp_cnt = 0; bk_cnt = 0; total_len = 0; cur_dist = 0;
+    path_freeze = 0;
+    gmem[0] = 0; 
+    slider13 = 0; sliderchange(slider13);
+);
+
+slider6 == 1 ? (
+    lin_freeze = 0;
+    path_freeze = 0;
+    cur_dist = 0;
+    bk_idx = 0;
+    start_x = direction == 0 ? -half_w : half_w;
+    src_x = start_x;
+    src_y = def_dist_y;
+    lin_sign = direction == 0 ? 1 : -1;
+    slider6 = 0; sliderchange(slider6);
+);
+
+@block
+move_amt = speed_ms / srate;
+
+@sample
+// --- MOVEMENT ---
+mode == 0 ? (
+    step = move_amt * lin_sign;
+    start_x = direction == 0 ? -half_w : half_w;
+    end_x = direction == 0 ? half_w : -half_w;
+    loop_enable == 0 && lin_freeze ? (
+        src_x = end_x;
+    ) : (
+        loop_enable ? (
+            lin_style == 1 ? (
+                src_x += step;
+                src_x > half_w ? ( src_x = half_w; lin_sign = -1; );
+                src_x < -half_w ? ( src_x = -half_w; lin_sign = 1; );
+            ) : (
+                src_x += step;
+                src_x > half_w ? src_x = -half_w;
+                src_x < -half_w ? src_x = half_w;
+            );
+        ) : (
+            src_x += step;
+            (direction == 0 && src_x >= half_w) ? ( src_x = half_w; lin_freeze = 1; );
+            (direction == 1 && src_x <= -half_w) ? ( src_x = -half_w; lin_freeze = 1; );
+            src_x = min(max(src_x, -half_w), half_w);
+        );
+    );
+    src_y = def_dist_y;
+) : (
+    (bk_cnt > 2 && is_updating == 0) ? (
+        start_x = bk_x[0];
+        start_y = bk_y[0];
+        end_x = bk_x[bk_cnt-1];
+        end_y = bk_y[bk_cnt-1];
+        loop_enable == 0 && path_freeze ? (
+            src_x = end_x;
+            src_y = end_y;
+        ) : (
+            loop_enable ? (
+                cur_dist += move_amt;
+                cur_dist >= total_len ? ( cur_dist -= total_len; bk_idx = 0; );
+            ) : (
+                cur_dist = min(cur_dist + move_amt, total_len);
+            );
+
+            while (bk_idx < bk_cnt - 2 && bk_d[bk_idx+1] < cur_dist) ( bk_idx += 1; );
+            
+            d1 = bk_d[bk_idx]; d2 = bk_d[bk_idx+1];
+            frac = (cur_dist - d1) / (d2 - d1 + 0.000001);
+            
+            src_x = bk_x[bk_idx] + (bk_x[bk_idx+1] - bk_x[bk_idx]) * frac;
+            src_y = bk_y[bk_idx] + (bk_y[bk_idx+1] - bk_y[bk_idx]) * frac;
+            loop_enable == 0 && cur_dist >= total_len ? (
+                path_freeze = 1;
+                src_x = end_x;
+                src_y = end_y;
+            );
+        );
+    ) : (
+        // If path is empty, stay at first point or center
+        cp_cnt > 0 ? ( src_x = cp_x[0]; src_y = cp_y[0]; ) : ( src_x = 0; src_y = 0; );
+    );
+);
+
+// --- AUDIO ---
+dist = sqrt(src_x*src_x + src_y*src_y);
+del_samps = (dist / speed_sound) * srate;
+
+buf_l[write_pos] = spl0;
+buf_r[write_pos] = spl1;
+
+rp = write_pos - fixed_lat - del_samps;
+while (rp < 0) ( rp += buf_len; );
+while (rp >= buf_len) ( rp -= buf_len; );
+
+idx = floor(rp); fr = rp - idx; nxt = (idx + 1) % buf_len;
+out0 = buf_l[idx]*(1-fr) + buf_l[nxt]*fr;
+out1 = buf_r[idx]*(1-fr) + buf_r[nxt]*fr;
+
+vol = 1 / (1 + dist*0.5);
+spl0 = out0 * vol;
+spl1 = out1 * vol;
+
+air_on = slider10;
+air_on != last_air_on ? (
+    last_air_on = air_on;
+    air_on ? ( lpL = spl0; lpR = spl1; );
+);
+
+air_on ? (
+    air_fc = 20000 * exp(-dist * 0.008);
+    air_fc < 3000 ? air_fc = 3000;
+    air_fc > 20000 ? air_fc = 20000;
+    air_a = exp(-2 * $pi * air_fc / srate);
+    lpL = (1 - air_a) * spl0 + air_a * lpL;
+    lpR = (1 - air_a) * spl1 + air_a * lpR;
+    spl0 = lpL;
+    spl1 = lpR;
+);
+
+// Panning based on angle around listener
+angle_rad = atan2(src_x, src_y);
+pan_pos = sin(angle_rad);
+pan_angle = (pan_pos + 1) * $pi * 0.25;
+spl0 *= cos(pan_angle);
+spl1 *= sin(pan_angle);
+
+// Stereo width (0% mono, 100% full stereo)
+mid = (spl0 + spl1) * 0.5;
+side = (spl0 - spl1) * 0.5;
+side *= stereo_w;
+spl0 = mid + side;
+spl1 = mid - side;
+
+// Output gain
+spl0 *= gain;
+spl1 *= gain;
+
+write_pos = (write_pos + 1) % buf_len;
+
+@gfx 600 400
+gfx_r=0; gfx_g=0; gfx_b=0.15; gfx_rect(0,0,gfx_w,gfx_h);
+cx = gfx_w/2; cy = gfx_h/2;
+scale = min(gfx_w, gfx_h) / width * 0.9;
+
+recalc = 0;
+force_bake == 1 ? ( recalc = 1; force_bake = 0; );
+
+// --- MOUSE INTERACTION ---
+mx = (mouse_x - cx) / scale;
+my = (mouse_y - cy) / scale;
+mx = min(max(mx, -half_w), half_w);
+my = min(max(my, -half_w), half_w);
+
+mouse_cap == 1 ? (
+    mouse_state == 0 ? (
+        mouse_state = 1; 
+        
+        // 1. HIT TEST (Are we clicking an existing point?)
+        // Increased radius to 15 pixels for easy grabbing
+        hit_px_dist = 15; 
+        hit_id = -1;
+        i = 0;
+        while (i < cp_cnt) (
+            px = cx + cp_x[i] * scale;
+            py = cy + cp_y[i] * scale;
+            abs(mouse_x - px) < hit_px_dist && abs(mouse_y - py) < hit_px_dist ? (
+                hit_id = i;
+            );
+            i += 1;
+        );
+        
+        hit_id >= 0 ? (
+            // YES -> Grab it
+            drag_idx = hit_id;
+        ) : (
+            // NO -> Create New Point
+            cp_cnt < 100 ? (
+                // Use exact mouse coordinates for the point
+                cp_x[cp_cnt] = mx; 
+                cp_y[cp_cnt] = my;
+                cp_cnt += 1; 
+                recalc = 1;
+            );
+        );
+    );
+    
+    // WHILE HOLDING CLICK
+    drag_idx >= 0 ? (
+        // Moving a point
+        cp_x[drag_idx] = mx;
+        cp_y[drag_idx] = my;
+        recalc = 1;
+    ) : (
+        // Drawing (Adding more points if dragging in empty space)
+        cp_cnt < 100 && drag_idx == -1 ? (
+             // Only add if we moved far enough from the last point
+             (abs(mx - cp_x[cp_cnt-1]) > 0.1 || abs(my - cp_y[cp_cnt-1]) > 0.1) ? (
+                     cp_x[cp_cnt] = mx; cp_y[cp_cnt] = my;
+                cp_cnt += 1; recalc = 1;
+             );
+        );
+    );
+    
+) : mouse_cap == 2 ? (
+    mouse_state_r == 0 ? (
+        mouse_state_r = 1;
+        cp_cnt > 0 ? ( cp_cnt -= 1; recalc = 1; cp_cnt < 2 ? (bk_cnt=0; total_len=0;); );
+    );
+) : (
+    mouse_state = 0; mouse_state_r = 0; drag_idx = -1;
+);
+
+// --- BAKING ---
+recalc && cp_cnt > 0 ? (
+    is_updating = 1;
+    // Save
+    gmem[0] = 12345; gmem[1] = cp_cnt;
+    i = 0; while (i < cp_cnt) ( gmem[1000+i] = cp_x[i]; gmem[2000+i] = cp_y[i]; i+=1; );
+
+    // Calc Curve
+    bk_cnt = 0; total_len = 0;
+    
+    // Single point case
+    cp_cnt == 1 ? (
+        bk_x[0] = cp_x[0]; bk_y[0] = cp_y[0]; bk_d[0] = 0;
+        bk_cnt = 1;
+    ) : (
+        // Multi point case
+        bk_x[0] = cp_x[0]; bk_y[0] = cp_y[0]; bk_d[0] = 0;
+        bk_cnt += 1;
+        
+        i = 0;
+        while (i < cp_cnt - 1) (
+            i0 = max(i-1, 0); i1 = i; i2 = i+1; i3 = min(i+2, cp_cnt-1);
+            p0x=cp_x[i0]; p1x=cp_x[i1]; p2x=cp_x[i2]; p3x=cp_x[i3];
+            p0y=cp_y[i0]; p1y=cp_y[i1]; p2y=cp_y[i2]; p3y=cp_y[i3];
+            
+            steps = 20; s = 1;
+            while (s <= steps) (
+                t = s / steps; t2 = t*t; t3 = t2*t;
+                nx = 0.5 * ((2*p1x) + (-p0x + p2x)*t + (2*p0x - 5*p1x + 4*p2x - p3x)*t2 + (-p0x + 3*p1x - 3*p2x + p3x)*t3);
+                ny = 0.5 * ((2*p1y) + (-p0y + p2y)*t + (2*p0y - 5*p1y + 4*p2y - p3y)*t2 + (-p0y + 3*p1y - 3*p2y + p3y)*t3);
+                
+                dx = nx - bk_x[bk_cnt-1]; dy = ny - bk_y[bk_cnt-1];
+                total_len += sqrt(dx*dx + dy*dy);
+                
+                bk_x[bk_cnt] = nx; bk_y[bk_cnt] = ny; bk_d[bk_cnt] = total_len;
+                bk_cnt += 1; s += 1;
+            );
+            i += 1;
+        );
+    );
+    is_updating = 0;
+);
+
+// --- VISUALIZATION ---
+fixed_scale = min(gfx_w, gfx_h) / 100; // Fixed 100m reference for listener distance
+ly = mode == 0 ? cy + (def_dist_y * fixed_scale) : cy;
+gfx_r=1; gfx_g=1; gfx_b=0; gfx_circle(cx, ly, 4, 1);
+gfx_x=cx+10; gfx_y=ly-5; gfx_drawstr("Listener");
+
+// Edge frame (shows canvas limits)
+fx = cx - half_w * scale;
+fy = cy - half_w * scale;
+fw = half_w * 2 * scale;
+fh = half_w * 2 * scale;
+gfx_r=0.25; gfx_g=0.25; gfx_b=0.35; gfx_a=1;
+gfx_rect(fx, fy, fw, fh, 0);
+
+// Distance line + label (from center)
+sx = cx + src_x * scale; sy = mode == 0 ? cy : cy + src_y * scale;
+gfx_r=0.6; gfx_g=0.6; gfx_b=0.9; gfx_a=1;
+gfx_line(cx, cy, sx, sy);
+gfx_dist = sqrt(src_x*src_x + src_y*src_y);
+sprintf(#dist_txt, "Dist: %.1f m", gfx_dist);
+gfx_x=10; gfx_y=10;
+gfx_drawstr(#dist_txt);
+
+// Scale bar (meters)
+// Centered scale (0 at listener, symmetric)
+tick_step = width <= 50 ? 5 : width <= 100 ? 10 : width <= 200 ? 20 : width <= 500 ? 50 : 100;
+tick_step < 5 ? tick_step = 5;
+tick_step > 200 ? tick_step = 200;
+bar_x = cx - half_w * scale; bar_y = fy + fh + 12; bar_w = half_w * 2 * scale;
+gfx_r=0.7; gfx_g=0.7; gfx_b=0.7; gfx_a=1;
+gfx_line(bar_x, bar_y, bar_x + bar_w, bar_y);
+gfx_line(bar_x, bar_y-4, bar_x, bar_y+4);
+gfx_line(bar_x + bar_w, bar_y-4, bar_x + bar_w, bar_y+4);
+
+i = -half_w;
+while (i < -half_w) ( i += tick_step; );
+while (i <= half_w) (
+    tx = cx + i * scale;
+    gfx_line(tx, bar_y-3, tx, bar_y+3);
+    tick_val = abs(i);
+    sprintf(#tick_txt, "%.0f", tick_val);
+    gfx_x = tx - 6; gfx_y = bar_y + 6;
+    gfx_drawstr(#tick_txt);
+    i += tick_step;
+);
+
+mode == 1 ? (
+    // Curve
+    bk_cnt > 1 ? (
+        gfx_r=0; gfx_g=1; gfx_b=0.5; gfx_a=1;
+        i = 0;
+        while (i < bk_cnt - 1) (
+            gfx_line(cx + bk_x[i]*scale, cy + bk_y[i]*scale, cx + bk_x[i+1]*scale, cy + bk_y[i+1]*scale);
+            i += 1;
+        );
+    );
+    
+    // Points (Big & Responsive)
+    i = 0;
+    while (i < cp_cnt) (
+        px = cx + cp_x[i]*scale; py = cy + cp_y[i]*scale;
+        
+        // Check hover with same radius as hit test (15px)
+        is_hover = (abs(mouse_x - px) < 15 && abs(mouse_y - py) < 15);
+        is_drag = (drag_idx == i);
+        
+        is_drag ? ( gfx_r=1; gfx_g=0; gfx_b=0; ) : 
+        is_hover ? ( gfx_r=1; gfx_g=0.5; gfx_b=0; ) : 
+                   ( gfx_r=0.2; gfx_g=0.6; gfx_b=1; ); 
+                   
+        gfx_circle(px, py, is_hover || is_drag ? 7 : 4, 1);
+        i += 1;
+    );
+);
+
+// Linear mode guide line
+mode == 0 ? (
+    gfx_r=0.3; gfx_g=0.3; gfx_b=0.3; gfx_a=1;
+    gfx_line(0, cy, gfx_w, cy);
+);
+
+gfx_r=1; gfx_g=0.5; gfx_b=0.2; gfx_a=1;
+gfx_circle(sx, sy, 8, 1);
+
+gfx_x=120; gfx_y=10; gfx_r=1; gfx_g=1; gfx_b=1;
+mode == 0 ? gfx_drawstr("Linear Mode") : gfx_drawstr("Click anywhere to start path. Drag points to move."); 
