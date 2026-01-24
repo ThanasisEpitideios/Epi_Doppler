@@ -1,23 +1,37 @@
-desc:Epi_Doppler v1
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Thanasis Epitideios
+
+desc:Epi_Doppler v1.1
 slider1:30<5, 1000, 0.1>Speed (km/h)
 slider2:0<0,1,1{Linear Loop,Custom Path}>Movement Mode
-slider3:1<0,1,1{Off,On}>Loop Enable
-slider4:0<0,1,1{Left to Right,Right to Left}>Linear Direction
-slider5:0<0,1,1{Wrap,PingPong}>Linear Loop Style
-slider6:0<0,1,1{-,Restart}>Restart
+slider3:1<0,3,1{Speed (One-Shot),Speed (Loop),Automation (Open),Automation (Loop)}>Mode
+slider4:0<0,1,1{Left to Right,Right to Left}>Direction
+slider5:0<0,1,1{Wrap,PingPong}>Style
+slider6:0<0,1,1{-,Restart}>Restart (Trigger)
 slider7:5<0.5, 50, 0.1>Listener Distance Y (m)
 slider8:100<10, 1000, 1>Canvas Width (m) 
 slider9:0<0,500,1>Latency Compensation (ms)
 slider10:0<0,1,1{Off,On}>Air Lowpass
 slider11:100<0,100,1>Stereo Width (%)
-slider12:0<-12,12,0.1>Output Gain (dB)
-slider13:0<0,1,1{-,Clear Path}>Clear Path
+slider12:0<-24,24,0.1>Output Gain (dB)
+slider13:0<0,1,1{-,Clear Path}>Clear Path (Trigger)
+slider14:100<0,200,1>Doppler Amount (%)
+slider15:0<0,100,0.1>Position (%)
 
 @init
 // --- MEMORY MAP ---
-buf_len = srate * 4; buf_l = 0; buf_r = 500000;
-cp_x = 1000000; cp_y = 1100000; // Control Points
-bk_x = 2000000; bk_y = 2100000; bk_d = 2200000; // Baked Path
+// Fixed offsets to ensure consistency between @serialize and @init
+buf_len = srate * 4; 
+buf_l = 0; 
+buf_r = 1000000; // Support up to ~5 sec delay at 192kHz
+// Place control points safely above buffers
+cp_x = 2000000; 
+cp_y = 2001000; 
+
+// Baked path points
+bk_x = 2002000; 
+bk_y = 2005000; 
+bk_d = 2008000;
 
 write_pos = 0;
 cur_dist = 0;
@@ -29,38 +43,94 @@ drag_idx = -1;
 lin_sign = 1;
 last_direction = -1;
 lpL = 0;
-lpR = 0;
+lpR = 0;  
 last_air_on = -1;
 lin_freeze = 0;
 path_freeze = 0;
 last_mode = -1;
+del_smooth = 0;
+pos_smooth = 0;
+last_play_state = -1;
+del_snap_cnt = 0;
+path_sign = 1;
 
-// --- RESTORE DATA ---
-gmem[0] == 12345 ? (
-    cp_cnt = gmem[1];
-    i = 0;
-    while (i < cp_cnt) (
-        cp_x[i] = gmem[1000 + i];
-        cp_y[i] = gmem[2000 + i];
-        i += 1;
-    );
+// Remember last usable settings for controls that can become inactive
+stored_direction = slider4;
+stored_loop_style = slider5;
+
+// --- UNWRAPPED POSITION PHASE (for seamless saw wrap) ---
+pos_raw_prev = 0;
+pos_phase = 0;
+pos_phase_smooth = 0;
+cur_dist_auto = 0;
+
+// --- TRIGGER STATE VARIABLES ---
+// Initialize to the *current* slider values so we don't auto-trigger on load
+last_restart_raw = slider6;
+last_clear_raw = slider13;
+
+// Used for pause-detection in @gfx (some REAPER states don't reliably set play_state pause bit)
+gfx_last_play_pos = -1;
+gfx_pause_stable = 0;
+
+// (Removed cp_cnt reset to preserve loaded path)
+// If cp_cnt is not initialized (first run), it will be 0 by default.
+
+@serialize
+// --- PERSIST PATH IN PROJECT STATE ---
+file_var(0, cp_cnt);
+cp_cnt < 0 ? cp_cnt = 0;
+cp_cnt > 100 ? cp_cnt = 100;
+i = 0;
+while (i < cp_cnt) (
+    file_var(0, cp_x[i]);
+    file_var(0, cp_y[i]);
+    i += 1;
+);
+
+cp_cnt > 0 ? (
     force_bake = 1;
-) : (
-    cp_cnt = 0; bk_cnt = 0; total_len = 0;
 );
 
 @slider
 speed_ms = slider1 / 3.6;
 mode = slider2;
-loop_enable = slider3;
+loop_mode = slider3;
 direction = slider4;
 lin_style = slider5;
+is_speed_mode = (loop_mode <= 1);
+speed_loop_enable = (loop_mode == 1);
+is_auto_mode = (loop_mode >= 2);
+auto_loop_pos = (loop_mode == 3);
 def_dist_y = slider7;
 width = slider8;
 fixed_lat = (slider9 * 0.001) * srate;
 half_w = width / 2;
 stereo_w = slider11 / 100;
 gain = 10^(slider12/20);
+doppler_amt = slider14 / 100;
+pos_norm = slider15 / 100;
+pos_auto = slider_automate[15];
+del_alpha = exp(-1 / (0.01 * srate));
+// Smoothing factor for position automation (~50ms time constant) to prevent zipper noise
+pos_alpha = exp(-1 / (0.05 * srate));
+
+// --- SOFT-DISABLE CONTROLS WHEN NOT APPLICABLE ---
+// Direction only applies to Linear movement.
+mode == 0 ? (
+    stored_direction = direction;
+) : (
+    slider4 = stored_direction;
+    direction = stored_direction;
+);
+
+// Loop Style only affects Speed looping (wrap/pingpong). When not looping, keep it locked.
+speed_loop_enable ? (
+    stored_loop_style = lin_style;
+) : (
+    slider5 = stored_loop_style;
+    lin_style = stored_loop_style;
+);
 
 direction != last_direction ? (
     lin_sign = direction == 0 ? 1 : -1;
@@ -74,43 +144,259 @@ mode != last_mode ? (
     last_mode = mode;
 );
 
-loop_enable ? (
+speed_loop_enable ? (
     lin_freeze = 0;
     path_freeze = 0;
+    path_sign = 1;
 );
 
-slider13 == 1 ? (
+// --- CLEAR PATH (AUTOMATION FIX) ---
+// Τρέχει μόνο όταν το slider πάει από 0 -> 1
+clear_raw = slider13;
+(clear_raw > 0.5 && last_clear_raw <= 0.5) ? (
     cp_cnt = 0; bk_cnt = 0; total_len = 0; cur_dist = 0;
     path_freeze = 0;
-    gmem[0] = 0; 
-    slider13 = 0; sliderchange(slider13);
+    // Momentary button behavior (always reset UI)
+    slider13 = 0;
 );
+last_clear_raw = clear_raw; // Αποθήκευση κατάστασης
 
-slider6 == 1 ? (
+// --- RESTART (AUTOMATION FIX) ---
+// Τρέχει μόνο όταν το slider πάει από 0 -> 1
+restart_raw = slider6;
+(restart_raw > 0.5 && last_restart_raw <= 0.5) ? (
+    // Restart is meaningful in Speed modes. In Automation modes it would immediately be overridden by Position.
+    is_speed_mode ? (
     lin_freeze = 0;
     path_freeze = 0;
     cur_dist = 0;
+    cur_dist_auto = 0;
     bk_idx = 0;
-    start_x = direction == 0 ? -half_w : half_w;
-    src_x = start_x;
-    src_y = def_dist_y;
-    lin_sign = direction == 0 ? 1 : -1;
-    slider6 = 0; sliderchange(slider6);
+    path_sign = 1;
+
+    // Reset automation phase trackers to the current Position value (prevents jumps)
+    pos_smooth = pos_norm;
+    pos_raw_prev = pos_smooth;
+    pos_phase = pos_smooth;
+    pos_phase_smooth = pos_smooth;
+
+    mode == 0 ? (
+        start_x = direction == 0 ? -half_w : half_w;
+        src_x = start_x;
+        src_y = def_dist_y;
+        lin_sign = direction == 0 ? 1 : -1;
+    ) : (
+        // Custom Path: restart should snap to the path start
+        bk_cnt > 0 ? (
+            src_x = bk_x[0];
+            src_y = bk_y[0];
+        ) : (
+            cp_cnt > 0 ? ( src_x = cp_x[0]; src_y = cp_y[0]; ) : ( src_x = 0; src_y = 0; );
+        );
+    );
+
+    // Avoid rapid pitch glide right after Restart
+    del_snap_cnt = 128;
+    );
+
+    // Momentary button behavior (always reset UI)
+    slider6 = 0;
 );
+last_restart_raw = restart_raw; // Αποθήκευση κατάστασης
+
 
 @block
+play_now = play_state & 1;
+play_now != last_play_state ? (
+    last_play_state = play_now;
+    pos_auto_blk = slider_automate[15];
+    loop_mode_blk = slider3;
+    is_auto_mode_blk = (loop_mode_blk >= 2);
+    auto_loop_pos_blk = (loop_mode_blk == 3);
+    speed_loop_enable_blk = (loop_mode_blk == 1);
+    pos_drive_blk = is_auto_mode_blk;
+
+    // When resuming Play, REAPER can restart DSP with stale state.
+    // Snap the *actual* source position to the current Position value if automated,
+    // otherwise we can briefly start from 0% and glide to the real value (audible pitch blend).
+    play_now ? (
+        // Always sync smoothing state to the current slider/envelope value at start.
+        pos_smooth = slider15 / 100;
+        // Reset unwrapped phase trackers to the current value on transport start.
+        pos_raw_prev = pos_smooth;
+        pos_phase = pos_smooth;
+        pos_phase_smooth = pos_smooth;
+
+        pos_drive_blk ? (
+            mode == 0 ? (
+                start_x = direction == 0 ? -half_w : half_w;
+                end_x = direction == 0 ? half_w : -half_w;
+                src_x = start_x + (end_x - start_x) * pos_smooth;
+                src_y = def_dist_y;
+                lin_freeze = 1;
+            ) : (
+                bk_cnt > 2 ? (
+                    auto_loop_pos_blk ? (
+                        // Automation Loop ON: cyclic mapping (implicit last->first segment)
+                        dx = bk_x[bk_cnt-1] - bk_x[0];
+                        dy = bk_y[bk_cnt-1] - bk_y[0];
+                        close_len = sqrt(dx*dx + dy*dy);
+                        cyc_len = total_len + close_len;
+                        snap_dist = cyc_len * pos_smooth;
+                        cur_dist_auto = snap_dist;
+
+                        snap_dist <= total_len || close_len < 0.000001 ? (
+                            bk_idx = 0;
+                            while (bk_idx < bk_cnt - 2 && bk_d[bk_idx+1] < snap_dist) ( bk_idx += 1; );
+                            d1 = bk_d[bk_idx]; d2 = bk_d[bk_idx+1];
+                            frac = (snap_dist - d1) / (d2 - d1 + 0.000001);
+                            src_x = bk_x[bk_idx] + (bk_x[bk_idx+1] - bk_x[bk_idx]) * frac;
+                            src_y = bk_y[bk_idx] + (bk_y[bk_idx+1] - bk_y[bk_idx]) * frac;
+                        ) : (
+                            frac = (snap_dist - total_len) / (close_len + 0.000001);
+                            src_x = bk_x[bk_cnt-1] + (bk_x[0] - bk_x[bk_cnt-1]) * frac;
+                            src_y = bk_y[bk_cnt-1] + (bk_y[0] - bk_y[bk_cnt-1]) * frac;
+                        );
+                    ) : (
+                        // Automation Loop OFF: open mapping
+                        snap_dist = total_len * pos_smooth;
+                        snap_dist < 0 ? snap_dist = 0;
+                        snap_dist > total_len ? snap_dist = total_len;
+                        cur_dist_auto = snap_dist;
+
+                        bk_idx = 0;
+                        while (bk_idx < bk_cnt - 2 && bk_d[bk_idx+1] < snap_dist) ( bk_idx += 1; );
+                        d1 = bk_d[bk_idx]; d2 = bk_d[bk_idx+1];
+                        frac = (snap_dist - d1) / (d2 - d1 + 0.000001);
+                        src_x = bk_x[bk_idx] + (bk_x[bk_idx+1] - bk_x[bk_idx]) * frac;
+                        src_y = bk_y[bk_idx] + (bk_y[bk_idx+1] - bk_y[bk_idx]) * frac;
+                    );
+                    path_freeze = 1;
+                ) : (
+                    cp_cnt > 0 ? ( src_x = cp_x[0]; src_y = cp_y[0]; ) : ( src_x = 0; src_y = 0; );
+                );
+            );
+        ) : (
+            // If not automated, keep whatever position we had.
+            pos_smooth = pos_norm;
+            pos_raw_prev = pos_smooth;
+            pos_phase = pos_smooth;
+            pos_phase_smooth = pos_smooth;
+        );
+
+        // Avoid rapid pitch glide on transport restart:
+        // snap delay to the correct target for a short time after entering Play.
+        del_snap_cnt = 128;
+
+        write_pos = 0;
+
+        // Clear delay buffer only when entering Play (prevents old-audio "whoosh" on restart)
+        i = 0; while (i < buf_len) ( buf_l[i] = 0; buf_r[i] = 0; i += 1; );
+    ) : (
+        del_snap_cnt = 0;
+        write_pos = 0;
+    );
+);
 move_amt = speed_ms / srate;
 
 @sample
+// --- SMOOTH AUTOMATION INPUT ---
+is_auto_mode && pos_auto ? (
+    // Phase-unwrapping so a saw 100%->0% becomes a small forward step (no teleport).
+    pos_raw = pos_norm;
+    dpos = pos_raw - pos_raw_prev;
+    dpos < -0.5 ? dpos += 1;
+    dpos > 0.5 ? dpos -= 1;
+    pos_phase += dpos;
+    pos_raw_prev = pos_raw;
+
+    // Smooth the *unwrapped* phase, then fold back to 0..1 for mapping.
+    pos_phase_smooth = pos_phase_smooth + (pos_phase - pos_phase_smooth) * (1 - pos_alpha);
+    pos_smooth = pos_phase_smooth - floor(pos_phase_smooth);
+    pos_smooth < 0 ? pos_smooth += 1;
+) : (
+    // In Automation mode (manual Position), still smooth to avoid zipper.
+    is_auto_mode ? (
+        pos_smooth = pos_smooth + (pos_norm - pos_smooth) * (1 - pos_alpha);
+        pos_raw_prev = pos_smooth;
+        pos_phase = pos_smooth;
+        pos_phase_smooth = pos_smooth;
+    ) : (
+        // In Speed mode, Position is not used for movement.
+        pos_smooth = pos_norm;
+        pos_raw_prev = pos_smooth;
+        pos_phase = pos_smooth;
+        pos_phase_smooth = pos_smooth;
+    );
+);
+
 // --- MOVEMENT ---
+pos_drive = is_auto_mode;
+pos_drive ? (
+    mode == 0 ? (
+        start_x = direction == 0 ? -half_w : half_w;
+        end_x = direction == 0 ? half_w : -half_w;
+        target_x = start_x + (end_x - start_x) * pos_smooth;
+        // Smoothly interpolate towards target to avoid zipper noise
+        src_x = (src_x * pos_alpha) + (target_x * (1 - pos_alpha));
+        src_y = def_dist_y;
+        lin_freeze = 1;
+    ) : (
+        (bk_cnt > 2 && is_updating == 0) ? (
+            auto_loop_pos ? (
+                // Automation Loop ON: cyclic mapping (implicit last->first segment)
+                dx = bk_x[bk_cnt-1] - bk_x[0];
+                dy = bk_y[bk_cnt-1] - bk_y[0];
+                close_len = sqrt(dx*dx + dy*dy);
+                cyc_len = total_len + close_len;
+
+                // IMPORTANT: smooth the *unwrapped* distance so saw wrap doesn't force the filter
+                // to glide backwards from ~1 -> ~0. Then wrap only for mapping.
+                target_dist = cyc_len * pos_phase_smooth;
+                cur_dist_auto = (cur_dist_auto * pos_alpha) + (target_dist * (1 - pos_alpha));
+
+                dist_mod = cur_dist_auto - floor(cur_dist_auto / (cyc_len + 0.000001)) * cyc_len;
+                dist_mod < 0 ? dist_mod += cyc_len;
+
+                dist_mod <= total_len || close_len < 0.000001 ? (
+                    bk_idx = 0;
+                    while (bk_idx < bk_cnt - 2 && bk_d[bk_idx+1] < dist_mod) ( bk_idx += 1; );
+                    d1 = bk_d[bk_idx]; d2 = bk_d[bk_idx+1];
+                    frac = (dist_mod - d1) / (d2 - d1 + 0.000001);
+                    src_x = bk_x[bk_idx] + (bk_x[bk_idx+1] - bk_x[bk_idx]) * frac;
+                    src_y = bk_y[bk_idx] + (bk_y[bk_idx+1] - bk_y[bk_idx]) * frac;
+                ) : (
+                    frac = (dist_mod - total_len) / (close_len + 0.000001);
+                    src_x = bk_x[bk_cnt-1] + (bk_x[0] - bk_x[bk_cnt-1]) * frac;
+                    src_y = bk_y[bk_cnt-1] + (bk_y[0] - bk_y[bk_cnt-1]) * frac;
+                );
+            ) : (
+                // Automation Loop OFF: open mapping
+                target_dist = total_len * pos_smooth;
+                target_dist < 0 ? target_dist = 0;
+                target_dist > total_len ? target_dist = total_len;
+
+                bk_idx = 0;
+                while (bk_idx < bk_cnt - 2 && bk_d[bk_idx+1] < target_dist) ( bk_idx += 1; );
+                d1 = bk_d[bk_idx]; d2 = bk_d[bk_idx+1];
+                frac = (target_dist - d1) / (d2 - d1 + 0.000001);
+                src_x = bk_x[bk_idx] + (bk_x[bk_idx+1] - bk_x[bk_idx]) * frac;
+                src_y = bk_y[bk_idx] + (bk_y[bk_idx+1] - bk_y[bk_idx]) * frac;
+            );
+            path_freeze = 1;
+        ) : (
+            cp_cnt > 0 ? ( src_x = cp_x[0]; src_y = cp_y[0]; ) : ( src_x = 0; src_y = 0; );
+        );
+    );
+) : (
 mode == 0 ? (
     step = move_amt * lin_sign;
     start_x = direction == 0 ? -half_w : half_w;
     end_x = direction == 0 ? half_w : -half_w;
-    loop_enable == 0 && lin_freeze ? (
+    speed_loop_enable == 0 && lin_freeze ? (
         src_x = end_x;
     ) : (
-        loop_enable ? (
+        speed_loop_enable ? (
             lin_style == 1 ? (
                 src_x += step;
                 src_x > half_w ? ( src_x = half_w; lin_sign = -1; );
@@ -130,21 +416,31 @@ mode == 0 ? (
     src_y = def_dist_y;
 ) : (
     (bk_cnt > 2 && is_updating == 0) ? (
-        start_x = bk_x[0];
-        start_y = bk_y[0];
         end_x = bk_x[bk_cnt-1];
         end_y = bk_y[bk_cnt-1];
-        loop_enable == 0 && path_freeze ? (
+        speed_loop_enable == 0 && path_freeze ? (
             src_x = end_x;
             src_y = end_y;
         ) : (
-            loop_enable ? (
-                cur_dist += move_amt;
-                cur_dist >= total_len ? ( cur_dist -= total_len; bk_idx = 0; );
+            speed_loop_enable ? (
+                lin_style == 1 ? (
+                    // PingPong along the baked path
+                    cur_dist += move_amt * path_sign;
+                    cur_dist >= total_len ? ( cur_dist = total_len; path_sign = -1; bk_idx = max(bk_cnt-2, 0); );
+                    cur_dist <= 0 ? ( cur_dist = 0; path_sign = 1; bk_idx = 0; );
+                ) : (
+                    // Wrap
+                    cur_dist += move_amt;
+                    cur_dist >= total_len ? ( cur_dist -= total_len; bk_idx = 0; );
+                );
             ) : (
                 cur_dist = min(cur_dist + move_amt, total_len);
             );
 
+            // bk_idx tracking must work in both directions (PingPong can go backwards)
+            path_sign < 0 ? (
+                while (bk_idx > 0 && bk_d[bk_idx] > cur_dist) ( bk_idx -= 1; );
+            );
             while (bk_idx < bk_cnt - 2 && bk_d[bk_idx+1] < cur_dist) ( bk_idx += 1; );
             
             d1 = bk_d[bk_idx]; d2 = bk_d[bk_idx+1];
@@ -152,7 +448,7 @@ mode == 0 ? (
             
             src_x = bk_x[bk_idx] + (bk_x[bk_idx+1] - bk_x[bk_idx]) * frac;
             src_y = bk_y[bk_idx] + (bk_y[bk_idx+1] - bk_y[bk_idx]) * frac;
-            loop_enable == 0 && cur_dist >= total_len ? (
+            speed_loop_enable == 0 && cur_dist >= total_len ? (
                 path_freeze = 1;
                 src_x = end_x;
                 src_y = end_y;
@@ -163,10 +459,18 @@ mode == 0 ? (
         cp_cnt > 0 ? ( src_x = cp_x[0]; src_y = cp_y[0]; ) : ( src_x = 0; src_y = 0; );
     );
 );
+);
 
 // --- AUDIO ---
 dist = sqrt(src_x*src_x + src_y*src_y);
-del_samps = (dist / speed_sound) * srate;
+del_target = (dist / speed_sound) * doppler_amt * srate;
+del_snap_cnt > 0 ? (
+    del_smooth = del_target;
+    del_snap_cnt -= 1;
+) : (
+    del_smooth = del_smooth + (del_target - del_smooth) * (1 - del_alpha);
+);
+del_samps = del_smooth;
 
 buf_l[write_pos] = spl0;
 buf_r[write_pos] = spl1;
@@ -224,6 +528,78 @@ write_pos = (write_pos + 1) % buf_len;
 gfx_r=0; gfx_g=0; gfx_b=0.15; gfx_rect(0,0,gfx_w,gfx_h);
 cx = gfx_w/2; cy = gfx_h/2;
 scale = min(gfx_w, gfx_h) / width * 0.9;
+
+// Read Position slider directly for display (some transport states can freeze @slider updates)
+gfx_pos_norm_manual = slider15 / 100;
+gfx_pos_auto = slider_automate[15];
+// If Position is automated, prefer last known automated value (pos_smooth) while paused/stopped
+gfx_pos_norm = gfx_pos_auto ? pos_smooth : gfx_pos_norm_manual;
+
+// --- PAUSE DETECTION (ROBUST) ---
+// If REAPER is "playing" but play_position isn't advancing, treat it like paused for display.
+gfx_play_pos = play_position;
+paused_like = 0;
+// Tolerance is in seconds. REAPER can jitter play_position slightly even while paused.
+pp_delta = gfx_last_play_pos < 0 ? 999 : abs(gfx_play_pos - gfx_last_play_pos);
+pp_delta < 0.0005 ? (
+    gfx_pause_stable += 1;
+) : (
+    gfx_pause_stable = 0;
+);
+// Consider it paused-like if transport is not fully stopped and play position is stable for a few frames.
+(play_state != 0 && gfx_pause_stable >= 3) ? paused_like = 1;
+gfx_last_play_pos = gfx_play_pos;
+
+// --- DISPLAY POSITION (UPDATE EVEN WHEN STOPPED) ---
+disp_x = src_x; disp_y = src_y;
+// Update visualization if Stopped (0) or Paused (bit 2) or "paused_like"
+(play_state == 0 || (play_state & 2) || paused_like) ? (
+    // Only show Position-driven cursor in Automation mode.
+    gfx_loop_mode = slider3;
+    gfx_is_auto_mode = (gfx_loop_mode >= 2);
+    gfx_is_auto_mode ? (
+        mode == 0 ? (
+            start_x = direction == 0 ? -half_w : half_w;
+            end_x = direction == 0 ? half_w : -half_w;
+            disp_x = start_x + (end_x - start_x) * gfx_pos_norm;
+            disp_y = def_dist_y;
+        ) : (
+            bk_cnt > 2 ? (
+                gfx_auto_loop_pos = (gfx_loop_mode == 3);
+                gfx_auto_loop_pos > 0.5 ? (
+                dx = bk_x[bk_cnt-1] - bk_x[0];
+                dy = bk_y[bk_cnt-1] - bk_y[0];
+                close_len = sqrt(dx*dx + dy*dy);
+                cyc_len = total_len + close_len;
+                target_dist = cyc_len * gfx_pos_norm;
+
+                target_dist <= total_len || close_len < 0.000001 ? (
+                    gfx_idx = 0;
+                    while (gfx_idx < bk_cnt - 2 && bk_d[gfx_idx+1] < target_dist) ( gfx_idx += 1; );
+                    d1 = bk_d[gfx_idx]; d2 = bk_d[gfx_idx+1];
+                    frac = (target_dist - d1) / (d2 - d1 + 0.000001);
+                    disp_x = bk_x[gfx_idx] + (bk_x[gfx_idx+1] - bk_x[gfx_idx]) * frac;
+                    disp_y = bk_y[gfx_idx] + (bk_y[gfx_idx+1] - bk_y[gfx_idx]) * frac;
+                ) : (
+                    frac = (target_dist - total_len) / (close_len + 0.000001);
+                    disp_x = bk_x[bk_cnt-1] + (bk_x[0] - bk_x[bk_cnt-1]) * frac;
+                    disp_y = bk_y[bk_cnt-1] + (bk_y[0] - bk_y[bk_cnt-1]) * frac;
+                );
+                ) : (
+                    target_dist = total_len * gfx_pos_norm;
+                    gfx_idx = 0;
+                    while (gfx_idx < bk_cnt - 2 && bk_d[gfx_idx+1] < target_dist) ( gfx_idx += 1; );
+                    d1 = bk_d[gfx_idx]; d2 = bk_d[gfx_idx+1];
+                    frac = (target_dist - d1) / (d2 - d1 + 0.000001);
+                    disp_x = bk_x[gfx_idx] + (bk_x[gfx_idx+1] - bk_x[gfx_idx]) * frac;
+                    disp_y = bk_y[gfx_idx] + (bk_y[gfx_idx+1] - bk_y[gfx_idx]) * frac;
+                );
+            ) : (
+                cp_cnt > 0 ? ( disp_x = cp_x[0]; disp_y = cp_y[0]; ) : ( disp_x = 0; disp_y = 0; );
+            );
+        );
+    );
+);
 
 recalc = 0;
 force_bake == 1 ? ( recalc = 1; force_bake = 0; );
@@ -296,10 +672,6 @@ mouse_cap == 1 ? (
 // --- BAKING ---
 recalc && cp_cnt > 0 ? (
     is_updating = 1;
-    // Save
-    gmem[0] = 12345; gmem[1] = cp_cnt;
-    i = 0; while (i < cp_cnt) ( gmem[1000+i] = cp_x[i]; gmem[2000+i] = cp_y[i]; i+=1; );
-
     // Calc Curve
     bk_cnt = 0; total_len = 0;
     
@@ -351,10 +723,10 @@ gfx_r=0.25; gfx_g=0.25; gfx_b=0.35; gfx_a=1;
 gfx_rect(fx, fy, fw, fh, 0);
 
 // Distance line + label (from center)
-sx = cx + src_x * scale; sy = mode == 0 ? cy : cy + src_y * scale;
+sx = cx + disp_x * scale; sy = mode == 0 ? cy : cy + disp_y * scale;
 gfx_r=0.6; gfx_g=0.6; gfx_b=0.9; gfx_a=1;
 gfx_line(cx, cy, sx, sy);
-gfx_dist = sqrt(src_x*src_x + src_y*src_y);
+gfx_dist = sqrt(disp_x*disp_x + disp_y*disp_y);
 sprintf(#dist_txt, "Dist: %.1f m", gfx_dist);
 gfx_x=10; gfx_y=10;
 gfx_drawstr(#dist_txt);
@@ -404,8 +776,8 @@ mode == 1 ? (
         
         is_drag ? ( gfx_r=1; gfx_g=0; gfx_b=0; ) : 
         is_hover ? ( gfx_r=1; gfx_g=0.5; gfx_b=0; ) : 
-                   ( gfx_r=0.2; gfx_g=0.6; gfx_b=1; ); 
-                   
+                    ( gfx_r=0.2; gfx_g=0.6; gfx_b=1; ); 
+                    
         gfx_circle(px, py, is_hover || is_drag ? 7 : 4, 1);
         i += 1;
     );
@@ -421,4 +793,4 @@ gfx_r=1; gfx_g=0.5; gfx_b=0.2; gfx_a=1;
 gfx_circle(sx, sy, 8, 1);
 
 gfx_x=120; gfx_y=10; gfx_r=1; gfx_g=1; gfx_b=1;
-mode == 0 ? gfx_drawstr("Linear Mode") : gfx_drawstr("Click anywhere to start path. Drag points to move."); 
+mode == 0 ? gfx_drawstr("Linear Mode") : gfx_drawstr("Click anywhere to start path. Drag points to move.");
